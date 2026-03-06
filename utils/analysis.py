@@ -6,11 +6,6 @@ import statsmodels.stats.api as sms
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
-import geopandas as gpd
-import libpysal
-from libpysal.weights import Queen
-import spreg
-from spreg import OLS, ML_Lag, ML_Error
 
 da_df = pd.read_csv("../data/dissemination_areas/dissemination_areas.csv")
 rn_df = pd.read_csv("../data/road_network/road_network.csv")
@@ -339,9 +334,27 @@ plt.show()
 
 ## ----------------------------------------- SPATIAL AUTOREGRESSION BY CSD ----------------------------------------
 #region
+"""
+For each CSD with >= 30 DAs:
+  1. Build queen contiguity weights
+  2. Run OLS and compute Moran's I on residuals
+  3. Run Lagrange Multiplier tests to choose lag vs error model
+     - If LM-lag sig  & LM-error not: use Spatial Lag
+     - If LM-error sig & LM-lag not:  use Spatial Error
+     - If both sig: use robust LM tests to decide
+     - If neither sig: OLS is sufficient (no spatial autocorrelation)
+  4. Fit the selected model and store results
+"""
+
+import geopandas as gpd
+import libpysal
+from libpysal.weights import Queen
+import spreg
+from spreg import OLS, ML_Lag, ML_Error
+from esda.moran import Moran
 
 # ── Load shapefile ─────────────────────────────────────────────────────────
-gdf = gpd.read_file("../data/dissemination_areas/dissemination areas.shp")
+gdf = gpd.read_file("../data/dissemination_areas/dissemination_areas_2021.shp")
 
 # Ensure DAUID is string in both for merging
 gdf["DAUID"] = gdf["DAUID"].astype(str)
@@ -399,7 +412,7 @@ for csd_id in valid_csds:
 
         # ── Build spatial weights ──────────────────────────────────
         try:
-            w = Queen.from_dataframe(sub, silence_warnings=True)
+            w = Queen.from_dataframe(sub, use_index=False, silence_warnings=True)
             w.transform = "r"  # row-standardise
         except Exception as e:
             print(f"  [{csd_name}] weights error: {e}")
@@ -420,8 +433,14 @@ for csd_id in valid_csds:
         lm_error  = ols.lm_error[1]
         rlm_lag   = ols.rlm_lag[1]
         rlm_error = ols.rlm_error[1]
-        moran_i   = ols.moran_res[0] if ols.moran_res is not None else np.nan
-        moran_p   = ols.moran_res[2] if ols.moran_res is not None else np.nan
+        # Compute Moran's I on OLS residuals separately
+        try:
+            mi = Moran(ols.u.flatten(), w)
+            moran_i = mi.I
+            moran_p = mi.p_sim
+        except Exception:
+            moran_i = np.nan
+            moran_p = np.nan
 
         # ── Model selection logic ──────────────────────────────────
         sig_lag   = lm_lag   < 0.05
@@ -448,8 +467,15 @@ for csd_id in valid_csds:
                     fitted = ML_Lag(y, X, w=w,
                                     name_y=y_var, name_x=X_cols, name_ds=csd_name)
                 else:
-                    fitted = ML_Error(y, X, w=w,
-                                      name_y=y_var, name_x=X_cols, name_ds=csd_name)
+                    try:
+                        fitted = ML_Error(y, X, w=w,
+                                          name_y=y_var, name_x=X_cols, name_ds=csd_name)
+                    except Exception as e_err:
+                        # ML_Error occasionally fails on certain geometries; fall back to ML_Lag
+                        print(f"  [{csd_name} | {y_var}] ML_Error failed ({e_err}), falling back to Spatial Lag")
+                        model_type = "Spatial Lag (fallback)"
+                        fitted = ML_Lag(y, X, w=w,
+                                        name_y=y_var, name_x=X_cols, name_ds=csd_name)
                 pseudo_r2 = fitted.pr2
                 aic       = fitted.aic if hasattr(fitted, "aic") else np.nan
                 coefs     = dict(zip(["const"] + X_cols, fitted.betas.flatten()))
