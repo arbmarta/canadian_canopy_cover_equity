@@ -19,11 +19,11 @@ library(jsonlite)
 # =============================================================================
 
 SHAPEFILE   <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/data/dissemination_areas/dissemination_areas_2021.shp"
-DIAG_CSV    <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/data/spatial_diagnostics.csv"
+DIAG_CSV    <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/out/spatial_diagnostics.csv"
 COMBINED_CSV <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/data/combined_dataset.csv"
 
-OUT_RESULTS <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/data/spatial_regression_results.csv"
-OUT_SUMMARY <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/data/spatial_regression_summary.csv"
+OUT_RESULTS <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/out/spatial_regression_results.csv"
+OUT_SUMMARY <- "C:/Users/alexj/Documents/PyCharm/PycharmProjects/canadian_tree_equity/out/spatial_regression_summary.csv"
 
 SPATIAL_INDEP_VARS  <- c("Ethno.cultural.Composition", "Economic.Dependency", "CISV.Scores")
 CANOPY_VARS         <- c("canopy_proportion_da",   "canopy_proportion_road")

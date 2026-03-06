@@ -498,8 +498,6 @@ col_order = ["CSDUID", "outcome", "n_DA",
              "LM SAC", "LM SAC p", "test_type"]
 
 print(diag_df[col_order].to_string(index=False))
-diag_df.to_csv("../data/spatial_diagnostics.csv", index=False)
-
-
+diag_df.to_csv("../out/spatial_diagnostics.csv", index=False)
 
 #endregion
