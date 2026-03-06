@@ -1,0 +1,9 @@
+"outcome","model_type","median_r2","mean_r2","n"
+"canopy_proportion_da","OLS",0.319,0.315,39
+"canopy_proportion_da","SAC",0.404,0.428,40
+"canopy_proportion_da","SEM",0.266,0.384,4
+"canopy_proportion_da","SLM",0.476,0.466,48
+"canopy_proportion_road","OLS",0.31,0.299,26
+"canopy_proportion_road","SAC",0.507,0.486,41
+"canopy_proportion_road","SEM",0.469,0.446,4
+"canopy_proportion_road","SLM",0.499,0.517,60
