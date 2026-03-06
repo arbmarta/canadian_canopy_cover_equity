@@ -1,0 +1,258 @@
+# =============================================================================
+# Spatial Regression Analysis — Canadian Tree Equity
+# Uses spatial_diagnostics.csv from Python to select models per CSD
+# Outputs: spatial_regression_results.csv, model_summary_tables.csv
+# =============================================================================
+
+library(sf)
+library(spdep)
+library(spatialreg)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+# =============================================================================
+# CONFIG — adjust paths as needed
+# =============================================================================
+
+SHAPEFILE   <- "../data/dissemination_areas/dissemination_areas_2021.shp"
+DIAG_CSV    <- "../data/spatial_diagnostics.csv"
+OUT_RESULTS <- "../data/spatial_regression_results.csv"
+OUT_SUMMARY <- "../data/spatial_regression_summary.csv"
+
+SPATIAL_INDEP_VARS  <- c("Ethno.cultural.Composition", "Economic.Dependency", "CISV.Scores")
+CANOPY_VARS         <- c("canopy_proportion_da",   "canopy_proportion_road")
+AREA_VARS           <- c("total_area_km2_da",       "total_area_km2_road")
+MIN_DA              <- 30
+
+# =============================================================================
+# HELPER: build formula string
+# =============================================================================
+
+make_formula <- function(y_var, predictors) {
+  as.formula(paste(y_var, "~", paste(predictors, collapse = " + ")))
+}
+
+# =============================================================================
+# HELPER: scale a data frame's numeric columns (returns data frame)
+# =============================================================================
+
+scale_df <- function(df, cols) {
+  df[cols] <- lapply(df[cols], function(x) as.numeric(scale(x)))
+  df
+}
+
+# =============================================================================
+# HELPER: classify model from LM test row (mirrors Python logic)
+# =============================================================================
+
+classify_model <- function(lm_lag_p, lm_err_p, rlm_lag_p, rlm_err_p,
+                            lm_lag,   lm_err,   lm_sac,   lm_sac_p) {
+  lag_sig   <- lm_lag_p  < 0.05
+  error_sig <- lm_err_p  < 0.05
+
+  if (!lag_sig && !error_sig) return("OLS")
+  if (error_sig && !lag_sig)  return("SEM")
+  if (lag_sig && !error_sig)  return("SLM")
+
+  # both significant — go to robust tests
+  rlag_sig   <- rlm_lag_p < 0.05
+  rerror_sig <- rlm_err_p < 0.05
+
+  if (rerror_sig && !rlag_sig)  return("SEM")
+  if (rlag_sig && !rerror_sig)  return("SLM")
+  if (!rlag_sig && !rerror_sig) return("SAC")
+
+  # both robust significant — pick largest statistic
+  candidates <- c()
+  if (lm_lag_p < 0.05) candidates["SLM"] <- lm_lag
+  if (lm_err_p < 0.05) candidates["SEM"] <- lm_err
+  if (!is.na(lm_sac_p) && lm_sac_p < 0.05) candidates["SAC"] <- lm_sac
+  if (length(candidates) > 0)
+    return(paste0(names(which.max(candidates)), " (all significant)"))
+  return("error")
+}
+
+# =============================================================================
+# HELPER: fit the indicated model, return tidy result list
+# =============================================================================
+
+fit_model <- function(test_type, formula, data_sf, listw, y_var, csd_name, csd_id, n_da) {
+
+  base_type <- str_replace(test_type, " \\(all significant\\)", "") |> trimws()
+
+  tryCatch({
+
+    if (base_type == "OLS") {
+      fit  <- lm(formula, data = data_sf)
+      coefs <- coef(fit)
+      r2    <- summary(fit)$r.squared
+      aic   <- AIC(fit)
+      model_type <- "OLS"
+
+    } else if (base_type == "SLM") {
+      fit  <- lagsarlm(formula, data = data_sf, listw = listw, method = "eigen")
+      coefs <- coef(fit)
+      r2    <- 1 - (var(residuals(fit)) / var(data_sf[[as.character(formula[[2]])]]))  # pseudo-R2
+      aic   <- AIC(fit)
+      model_type <- "SLM"
+
+    } else if (base_type == "SEM") {
+      fit  <- errorsarlm(formula, data = data_sf, listw = listw, method = "eigen")
+      coefs <- coef(fit)
+      r2    <- 1 - (var(residuals(fit)) / var(data_sf[[as.character(formula[[2]])]]))
+      aic   <- AIC(fit)
+      model_type <- "SEM"
+
+    } else if (base_type == "SAC") {
+      fit  <- sacsarlm(formula, data = data_sf, listw = listw, method = "eigen")
+      coefs <- coef(fit)
+      r2    <- 1 - (var(residuals(fit)) / var(data_sf[[as.character(formula[[2]])]]))
+      aic   <- AIC(fit)
+      model_type <- "SAC"
+
+    } else {
+      message(sprintf("  [%s | %s] Unknown model type '%s'; skipping", csd_name, y_var, test_type))
+      return(NULL)
+    }
+
+    # flatten coefs into named list
+    coef_list <- as.list(coefs)
+    names(coef_list) <- paste0("coef_", names(coef_list))
+
+    result <- c(
+      list(
+        CSDUID     = csd_id,
+        CSD_name   = csd_name,
+        outcome    = y_var,
+        n_DA       = n_da,
+        model_type = model_type,
+        test_type  = test_type,
+        r2         = round(r2, 4),
+        aic        = round(aic, 2)
+      ),
+      coef_list
+    )
+    return(result)
+
+  }, error = function(e) {
+    message(sprintf("  [%s | %s] %s failed: %s", csd_name, y_var, base_type, conditionMessage(e)))
+    return(NULL)
+  })
+}
+
+# =============================================================================
+# LOAD DATA
+# =============================================================================
+
+message("Loading shapefile...")
+gdf <- st_read(SHAPEFILE, quiet = TRUE)
+gdf$DAUID  <- as.character(gdf$DAUID)
+gdf$CSDUID <- as.character(gdf$CSDUID)
+
+message("Loading diagnostics...")
+diag_df <- read.csv(DIAG_CSV) |>
+  mutate(CSDUID = as.character(CSDUID))
+
+# Use test_type from Python diagnostics directly
+diag_index <- diag_df |>
+  select(CSDUID, outcome, test_type, n_DA) |>
+  mutate(key = paste(CSDUID, outcome, sep = "_"))
+
+valid_csds <- unique(diag_df$CSDUID)
+message(sprintf("CSDs to process: %d", length(valid_csds)))
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+
+spatial_results <- list()
+
+for (csd_id in valid_csds) {
+
+  csd_gdf  <- gdf[gdf$CSDUID == csd_id, ]
+  csd_name <- as.character(csd_gdf$CSDNAME[1])
+
+  for (i in seq_along(CANOPY_VARS)) {
+    y_var    <- CANOPY_VARS[i]
+    area_var <- AREA_VARS[i]
+
+    # look up indicated model
+    key_match <- diag_index[diag_index$key == paste(csd_id, y_var, sep = "_"), ]
+    if (nrow(key_match) == 0) next
+    test_type <- key_match$test_type[1]
+
+    # build analysis subset
+    needed <- c(y_var, area_var, SPATIAL_INDEP_VARS, "geometry")
+    # only keep columns that exist
+    needed <- needed[needed %in% names(csd_gdf) | needed == "geometry"]
+    sub <- csd_gdf[, needed, drop = FALSE]
+    sub <- sub[complete.cases(st_drop_geometry(sub)), ]
+
+    if (nrow(sub) < MIN_DA) next
+
+    # check all predictors present
+    present_preds <- SPATIAL_INDEP_VARS[SPATIAL_INDEP_VARS %in% names(sub)]
+    if (length(present_preds) == 0 || !(area_var %in% names(sub))) next
+
+    # scale
+    scale_cols <- c(present_preds, area_var, y_var)
+    scale_cols <- scale_cols[scale_cols %in% names(sub)]
+    sub_s <- st_drop_geometry(sub)
+    sub_s <- scale_df(sub_s, scale_cols)
+    sub_s$geometry <- st_geometry(sub)
+    sub_s <- st_as_sf(sub_s)
+
+    # drop zero-variance predictors
+    pred_cols <- c(present_preds, area_var)
+    pred_cols <- pred_cols[sapply(pred_cols, function(c) sd(sub_s[[c]], na.rm = TRUE) > 1e-8)]
+    if (length(pred_cols) == 0) next
+
+    # build spatial weights
+    nb <- tryCatch(poly2nb(sub_s, queen = TRUE), error = function(e) NULL)
+    if (is.null(nb)) next
+    if (any(card(nb) == 0)) next  # skip if any islands
+
+    listw <- nb2listw(nb, style = "W", zero.policy = FALSE)
+
+    formula <- make_formula(y_var, pred_cols)
+    n_da    <- nrow(sub_s)
+
+    result <- fit_model(test_type, formula, sub_s, listw, y_var, csd_name, csd_id, n_da)
+    if (!is.null(result)) spatial_results[[length(spatial_results) + 1]] <- result
+  }
+
+  message(sprintf("  Processed: %s", csd_name))
+}
+
+# =============================================================================
+# COMBINE AND SAVE RESULTS
+# =============================================================================
+
+message("Combining results...")
+spatial_df <- bind_rows(spatial_results)
+
+write.csv(spatial_df, OUT_RESULTS, row.names = FALSE)
+message(sprintf("Saved: %s  (%d rows)", OUT_RESULTS, nrow(spatial_df)))
+
+# Model count summary
+cat("\nModels fitted by outcome and type:\n")
+print(
+  spatial_df |>
+    count(outcome, model_type) |>
+    pivot_wider(names_from = model_type, values_from = n, values_fill = 0)
+)
+
+# Median R2 summary
+cat("\nMedian R² by outcome and model type:\n")
+r2_summary <- spatial_df |>
+  group_by(outcome, model_type) |>
+  summarise(median_r2 = round(median(r2, na.rm = TRUE), 3),
+            mean_r2   = round(mean(r2,   na.rm = TRUE), 3),
+            n         = n(),
+            .groups = "drop")
+
+print(r2_summary)
+write.csv(r2_summary, OUT_SUMMARY, row.names = FALSE)
+message(sprintf("Saved: %s", OUT_SUMMARY))

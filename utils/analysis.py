@@ -6,6 +6,12 @@ import statsmodels.stats.api as sms
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
+import geopandas as gpd
+from libpysal.weights import Queen
+from spreg import OLS, ML_Lag, ML_Error, GM_Combo
+from esda.moran import Moran
+import warnings
+from libpysal import weights
 
 da_df = pd.read_csv("../data/dissemination_areas/dissemination_areas.csv")
 rn_df = pd.read_csv("../data/road_network/road_network.csv")
@@ -13,6 +19,7 @@ rn_df = pd.read_csv("../data/road_network/road_network.csv")
 rn_df = rn_df.drop(columns=["LANDAREA", "CSDUID", "CSDNAME"])
 df = da_df.merge(rn_df, on="DAUID", how="left", suffixes=("_da", "_road"))
 
+pop_dens = pd.read_csv('../data/population_density/98100015.csv')
 cimd = pd.read_csv("../data/can_scores_quintiles_csv-eng/can_scores_quintiles_EN.csv")
 cisr = pd.read_csv('../data/cisr-eng/cisr_scores_quintiles-eng.csv')
 cisv = pd.read_csv('../data/cisv-eng/cisv_scores_quintiles-eng.csv')
@@ -20,6 +27,7 @@ census_indep_vars = pd.read_csv("../data/Canadian_urban_forest_census_independen
 
 df = (
     df
+    .merge(pop_dens, on="DAUID", how="left", suffixes=("", "_da"))
     .merge(cimd, on="DAUID", how="left")
     .merge(cisr, on="DAUID", how="left")
     .merge(cisv, on="DAUID", how="left")
@@ -31,6 +39,9 @@ print(df.columns)
 # Encode binary variables
 df['in_eab_area_2024'] = df['in_eab_area_2024'].map({'Yes': 1, 'No': 0})
 df['in_eab_area_2025'] = df['in_eab_area_2025'].map({'Yes': 1, 'No': 0})
+
+df.to_csv("../data/combined_dataset.csv", index=False)
+
 
 ## ----------------------------------------------- CALCULATE GINI INDEX ------------------------------------------------
 #region
@@ -60,7 +71,7 @@ gini_road = df_filtered.groupby("CSDUID")["canopy_area_km2_road"].apply(gini)
 gini_df = pd.DataFrame({"DA": gini_da, "Road": gini_road}).dropna()
 gini_df["Difference"] = gini_df["Road"] - gini_df["DA"]
 
-# ── Styling ───────────────────────────────────────────────────────────────────
+#  Styling 
 plt.rcParams.update({
     "figure.dpi": 150,
     "font.size": 10,
@@ -178,6 +189,7 @@ canopy_cover = ['canopy_proportion_da', 'canopy_proportion_road']
 area = ['total_area_km2_da', 'total_area_km2_road']
 
 indep_vars = [
+    #'Population Density (sq km)_x', 'Population, 2021_x',
     'coverage_pct', 'in_eab_area_2024',
     'avg_annual_precip_mm', 'avg_annual_frost_free_days',
     'Ethno-cultural Composition', 'Economic Dependency',
@@ -186,6 +198,7 @@ indep_vars = [
 
 # Variables to standardise (continuous only — binary left as-is)
 continuous_vars = [
+    #'Population Density (sq km)_x', 'Population, 2021_x',
     'coverage_pct',
     'avg_annual_precip_mm', 'avg_annual_frost_free_days',
     'Ethno-cultural Composition', 'Economic Dependency',
@@ -205,7 +218,7 @@ for y_var, area_var in zip(canopy_cover, area):
     cols = [y_var, area_var] + indep_vars
     data = df[cols].dropna().copy()
 
-    # ── Standardise continuous predictors ──────────────────────────
+    #  Standardise continuous predictors 
     scaler = StandardScaler()
     data_scaled = data.copy()
     data_scaled[continuous_vars] = scaler.fit_transform(data[continuous_vars])
@@ -217,11 +230,11 @@ for y_var, area_var in zip(canopy_cover, area):
 
     X = sm.add_constant(X)
 
-    # ── OLS with HC3 robust standard errors ────────────────────────
+    #  OLS with HC3 robust standard errors 
     model = sm.OLS(y, X).fit(cov_type='HC3')
     print(model.summary())
 
-    # ── Assumption Checks ──────────────────────────────────────────
+    #  Assumption Checks 
     residuals = model.resid
     fitted = model.fittedvalues
 
@@ -270,20 +283,22 @@ for y_var, area_var in zip(canopy_cover, area):
         "pval":  model.pvalues,
     }).drop(index="const")
 
-# ── Combined Coefficient Plot (significant predictors only) ────────────────
+#  Combined Coefficient Plot (significant predictors only) ─
 COL_DA   = "#2D6A4F"
 COL_ROAD = "#D4A017"
 
 label_map = {
-    "coverage_pct":                "Municipal Canopy Coverage (%)",
-    "in_eab_area_2024":            "EAB Infestation Area",
-    "avg_annual_precip_mm":        "Annual Precipitation (mm)",
-    "avg_annual_frost_free_days":  "Frost-Free Days",
-    "Ethno-cultural Composition":  "Ethno-cultural Composition",
-    "Economic Dependency":         "Economic Dependency",
-    "CISV Scores":                 "Social Vulnerability (CISV)",
-    "total_area_km2_da":           "DA Area (km²)",
-    "total_area_km2_road":         "Road Area (km²)",
+    'Population, 2021_x':           "Population",
+    'Population Density (sq km)_x': "Population Density (sq km)",
+    "coverage_pct":                 "Municipal Canopy Coverage (%)",
+    "in_eab_area_2024":             "EAB Infestation Area",
+    "avg_annual_precip_mm":         "Annual Precipitation (mm)",
+    "avg_annual_frost_free_days":   "Frost-Free Days",
+    "Ethno-cultural Composition":   "Ethno-cultural Composition",
+    "Economic Dependency":          "Economic Dependency",
+    "CISV Scores":                  "Social Vulnerability (CISV)",
+    "total_area_km2_da":            "DA Area (km²)",
+    "total_area_km2_road":          "Road Area (km²)",
 }
 
 da_sig   = coef_results["canopy_proportion_da"][coef_results["canopy_proportion_da"]["pval"] < 0.05]
@@ -332,186 +347,159 @@ plt.show()
 
 #endregion
 
-## ----------------------------------------- SPATIAL AUTOREGRESSION BY CSD ----------------------------------------
+## ----------------------------------- IDENTIFY SPATIAL LAG AND SPATIAL ERROR BY CSD -----------------------------------
 #region
-"""
-For each CSD with >= 30 DAs:
-  1. Build queen contiguity weights
-  2. Run OLS and compute Moran's I on residuals
-  3. Run Lagrange Multiplier tests to choose lag vs error model
-     - If LM-lag sig  & LM-error not: use Spatial Lag
-     - If LM-error sig & LM-lag not:  use Spatial Error
-     - If both sig: use robust LM tests to decide
-     - If neither sig: OLS is sufficient (no spatial autocorrelation)
-  4. Fit the selected model and store results
-"""
 
-import geopandas as gpd
-import libpysal
-from libpysal.weights import Queen
-import spreg
-from spreg import OLS, ML_Lag, ML_Error
-from esda.moran import Moran
-
-# ── Load shapefile ─────────────────────────────────────────────────────────
+# Load shapefile and ensure string keys
 gdf = gpd.read_file("../data/dissemination_areas/dissemination_areas_2021.shp")
-
-# Ensure DAUID is string in both for merging
 gdf["DAUID"] = gdf["DAUID"].astype(str)
 df["DAUID"]  = df["DAUID"].astype(str)
 
-# Merge attribute data onto geodataframe
-gdf = gdf.merge(df.drop(columns=[c for c in df.columns if c in gdf.columns and c != "DAUID"]),
-                on="DAUID", how="left")
+# Merge attribute data onto geodataframe (avoid duplicating identical columns)
+cols_to_merge = [c for c in df.columns if c not in gdf.columns or c == "DAUID"]
+gdf = gdf.merge(df[cols_to_merge], on="DAUID", how="left")
 
-# ── Variables ──────────────────────────────────────────────────────────────
+# Spatial model variables (small set you've chosen)
 spatial_indep_vars = [
-    'coverage_pct', 'in_eab_area_2024',
-    'avg_annual_precip_mm', 'avg_annual_frost_free_days',
     'Ethno-cultural Composition', 'Economic Dependency',
     'CISV Scores'
 ]
-spatial_continuous = [
-    'coverage_pct', 'avg_annual_precip_mm', 'avg_annual_frost_free_days',
-    'Ethno-cultural Composition', 'Economic Dependency', 'CISV Scores'
-]
-
+# For scaling we will derive per-CSD the actual continuous cols present
 spatial_canopy_vars = ['canopy_proportion_da', 'canopy_proportion_road']
 spatial_area_vars   = ['total_area_km2_da',    'total_area_km2_road']
 
-# ── Identify valid CSDs (>= 30 DAs) ───────────────────────────────────────
+# Identify valid CSDs (>= 30 DAs)
 csd_counts = gdf.groupby("CSDUID").size()
-valid_csds  = csd_counts[csd_counts >= 30].index.tolist()
+valid_csds = csd_counts[csd_counts >= 30].index.tolist()
 print(f"\nCSDs with >= 30 DAs: {len(valid_csds)}")
 
-# ── Results container ──────────────────────────────────────────────────────
-spatial_results = []
+# Spatial diagnostics table by CSD
+results = []
 
 for csd_id in valid_csds:
     csd_gdf = gdf[gdf["CSDUID"] == csd_id].copy().reset_index(drop=True)
-    csd_name = csd_gdf["CSDNAME_x"].iloc[0] if "CSDNAME_x" in csd_gdf.columns else str(csd_id)
+    csd_name = csd_gdf.get("CSDNAME", pd.Series([str(csd_id)])).iloc[0]
 
     for y_var, area_var in zip(spatial_canopy_vars, spatial_area_vars):
 
-        all_cols = [y_var, area_var] + spatial_indep_vars
-        sub = csd_gdf[all_cols + ["geometry"]].dropna().copy().reset_index(drop=True)
+        needed = [y_var, area_var] + spatial_indep_vars
+        sub = csd_gdf[needed + ["geometry"]].dropna().copy().reset_index(drop=True)
 
         if len(sub) < 30:
             continue
 
-        # ── Scale ──────────────────────────────────────────────────
-        scaler = StandardScaler()
-        sub_s  = sub.copy()
-        scale_cols = spatial_continuous + [area_var]
-        sub_s[scale_cols] = scaler.fit_transform(sub[scale_cols])
-        sub_s[y_var]      = StandardScaler().fit_transform(sub[[y_var]])
-
-        y = sub_s[y_var].values.reshape(-1, 1)
-        X_cols = spatial_indep_vars + [area_var]
-        X = sub_s[X_cols].values
-
-        # ── Build spatial weights ──────────────────────────────────
-        try:
-            w = Queen.from_dataframe(sub, use_index=False, silence_warnings=True)
-            w.transform = "r"  # row-standardise
-        except Exception as e:
-            print(f"  [{csd_name}] weights error: {e}")
+        present_predictors = [c for c in spatial_indep_vars if c in sub.columns]
+        if not present_predictors or area_var not in sub.columns:
             continue
 
+        sub_s = sub.copy()
+        scale_cols = [c for c in present_predictors if np.issubdtype(sub[c].dtype, np.number)]
+        if np.issubdtype(sub[area_var].dtype, np.number):
+            scale_cols += [area_var]
+        if scale_cols:
+            sub_s[scale_cols] = StandardScaler().fit_transform(sub[scale_cols])
+        if np.issubdtype(sub_s[y_var].dtype, np.number):
+            sub_s[y_var] = StandardScaler().fit_transform(sub[[y_var]])
+        else:
+            continue
+
+        y = sub_s[y_var].astype(float).values.reshape(-1, 1)
+        X_cols = present_predictors + [area_var]
+        X_df = sub_s[X_cols].copy()
+        X_df['const'] = 1.0
+        try:
+            X_df = X_df.astype(float)
+        except Exception:
+            continue
+
+        # Drop zero-variance columns
+        tiny_eps = 1e-8
+        zero_var_cols = [c for c in X_df.columns
+                         if X_df[c].nunique(dropna=True) <= 1 or np.nanstd(X_df[c].values) < tiny_eps]
+        X_df = X_df.drop(columns=[c for c in zero_var_cols if c != 'const'])
+        X_order = ['const'] + [c for c in X_cols if c in X_df.columns]
+        if X_order == ['const']:
+            continue
+
+        X_array = X_df[X_order].values
+
+        try:
+            w = Queen.from_dataframe(sub, use_index=False, silence_warnings=True)
+            w.transform = "r"
+        except Exception:
+            continue
         if w.n != len(sub):
             continue
 
-        # ── OLS + LM diagnostics ───────────────────────────────────
         try:
-            ols = OLS(y, X, w=w, spat_diag=True,
-                      name_y=y_var, name_x=X_cols, name_ds=csd_name)
+            ols = OLS(y, X_array, w=w, spat_diag=True,
+                      name_y=y_var, name_x=X_order, name_ds=csd_name)
         except Exception as e:
             print(f"  [{csd_name} | {y_var}] OLS error: {e}")
             continue
 
-        lm_lag    = ols.lm_lag[1]    # p-value
-        lm_error  = ols.lm_error[1]
-        rlm_lag   = ols.rlm_lag[1]
-        rlm_error = ols.rlm_error[1]
-        # Compute Moran's I on OLS residuals separately
-        try:
-            mi = Moran(ols.u.flatten(), w)
-            moran_i = mi.I
-            moran_p = mi.p_sim
-        except Exception:
-            moran_i = np.nan
-            moran_p = np.nan
+        results.append({
+            "CSD":           csd_name,
+            "CSDUID":        csd_id,
+            "outcome":       y_var,
+            "n_DA":          len(sub),
+            "LM Lag":        round(ols.lm_lag[0], 4)   if hasattr(ols, "lm_lag")   else np.nan,
+            "LM Lag p":      round(ols.lm_lag[1], 4)   if hasattr(ols, "lm_lag")   else np.nan,
+            "LM Error":      round(ols.lm_error[0], 4) if hasattr(ols, "lm_error") else np.nan,
+            "LM Error p":    round(ols.lm_error[1], 4) if hasattr(ols, "lm_error") else np.nan,
+            "RLM Lag":       round(ols.rlm_lag[0], 4)  if hasattr(ols, "rlm_lag")  else np.nan,
+            "RLM Lag p":     round(ols.rlm_lag[1], 4)  if hasattr(ols, "rlm_lag")  else np.nan,
+            "RLM Error":     round(ols.rlm_error[0], 4)if hasattr(ols, "rlm_error")else np.nan,
+            "RLM Error p":   round(ols.rlm_error[1], 4)if hasattr(ols, "rlm_error")else np.nan,
+            "LM SAC": round(ols.lm_sarma[0], 4) if hasattr(ols, "lm_sarma") else np.nan,
+            "LM SAC p": round(ols.lm_sarma[1], 4) if hasattr(ols, "lm_sarma") else np.nan,
+        })
 
-        # ── Model selection logic ──────────────────────────────────
-        sig_lag   = lm_lag   < 0.05
-        sig_error = lm_error < 0.05
 
-        if not sig_lag and not sig_error:
-            model_type  = "OLS"
-            fitted      = ols
-            pseudo_r2   = ols.r2
-            aic         = ols.aic if hasattr(ols, "aic") else np.nan
-            coefs       = dict(zip(["const"] + X_cols, ols.betas.flatten()))
-        elif sig_lag and not sig_error:
-            model_type = "Spatial Lag"
-        elif sig_error and not sig_lag:
-            model_type = "Spatial Error"
-        else:
-            # Both significant — use robust LM to decide
-            model_type = "Spatial Lag" if rlm_lag < rlm_error else "Spatial Error"
+diag_df = pd.DataFrame(results)
 
-        # ── Fit spatial model if needed ────────────────────────────
-        if model_type != "OLS":
-            try:
-                if model_type == "Spatial Lag":
-                    fitted = ML_Lag(y, X, w=w,
-                                    name_y=y_var, name_x=X_cols, name_ds=csd_name)
-                else:
-                    try:
-                        fitted = ML_Error(y, X, w=w,
-                                          name_y=y_var, name_x=X_cols, name_ds=csd_name)
-                    except Exception as e_err:
-                        # ML_Error occasionally fails on certain geometries; fall back to ML_Lag
-                        print(f"  [{csd_name} | {y_var}] ML_Error failed ({e_err}), falling back to Spatial Lag")
-                        model_type = "Spatial Lag (fallback)"
-                        fitted = ML_Lag(y, X, w=w,
-                                        name_y=y_var, name_x=X_cols, name_ds=csd_name)
-                pseudo_r2 = fitted.pr2
-                aic       = fitted.aic if hasattr(fitted, "aic") else np.nan
-                coefs     = dict(zip(["const"] + X_cols, fitted.betas.flatten()))
-            except Exception as e:
-                print(f"  [{csd_name} | {y_var}] {model_type} error: {e}")
-                continue
+def classify_model(row):
+    lag_sig   = row["LM Lag p"]   < 0.05
+    error_sig = row["LM Error p"] < 0.05
 
-        row = {
-            "CSDUID":       csd_id,
-            "CSD_name":     csd_name,
-            "n_DA":         len(sub),
-            "outcome":      y_var,
-            "model":        model_type,
-            "pseudo_r2":    round(pseudo_r2, 4),
-            "AIC":          round(aic, 2) if not np.isnan(aic) else np.nan,
-            "moran_I":      round(moran_i, 4) if not np.isnan(moran_i) else np.nan,
-            "moran_p":      round(moran_p, 4) if not np.isnan(moran_p) else np.nan,
-            "lm_lag_p":     round(lm_lag, 4),
-            "lm_error_p":   round(lm_error, 4),
-        }
-        # Attach coefficients
-        for k, v in coefs.items():
-            row[f"coef_{k}"] = round(v, 6)
+    if not lag_sig and not error_sig:
+        return "OLS"
+    elif error_sig and not lag_sig:
+        return "SEM"
+    elif lag_sig and not error_sig:
+        return "SLM"
+    else:  # both significant — go to robust tests
+        rlag_sig   = row["RLM Lag p"]   < 0.05
+        rerror_sig = row["RLM Error p"] < 0.05
 
-        spatial_results.append(row)
+        if rerror_sig and not rlag_sig:
+            return "SEM"
+        elif rlag_sig and not rerror_sig:
+            return "SLM"
+        elif not rlag_sig and not rerror_sig:
+            return "SAC"
+        else:  # both robust significant — pick largest of LM Lag, LM Error, LM SAC
+            stats = {}
+            if row["LM Lag p"] < 0.05: stats["SLM"] = row["LM Lag"]
+            if row["LM Error p"] < 0.05: stats["SEM"] = row["LM Error"]
+            if row["LM SAC p"] < 0.05: stats["SAC"] = row["LM SAC"]
 
-# ── Save results ───────────────────────────────────────────────────────────
-spatial_df = pd.DataFrame(spatial_results)
-spatial_df.to_csv("../data/spatial_regression_results.csv", index=False)
-print(f"\nSpatial regression complete. {len(spatial_df)} models fitted across {len(valid_csds)} CSDs.")
+            if stats:
+                winner = max(stats, key=stats.get)
+                return f"{winner} (all significant)"
+            else:
+                return "error"  # fallback if somehow none are significant
 
-# ── Summary table ──────────────────────────────────────────────────────────
-print("\nModel selection summary:")
-print(spatial_df.groupby(["outcome", "model"]).size().unstack(fill_value=0).to_string())
+diag_df["test_type"] = diag_df.apply(classify_model, axis=1)
 
-print("\nMedian pseudo-R² by outcome and model:")
-print(spatial_df.groupby(["outcome", "model"])["pseudo_r2"].median().unstack(fill_value=np.nan).round(3).to_string())
+col_order = ["CSDUID", "outcome", "n_DA",
+             "LM Lag", "LM Lag p", "LM Error", "LM Error p",
+             "RLM Lag", "RLM Lag p", "RLM Error", "RLM Error p",
+             "LM SAC", "LM SAC p", "test_type"]
+
+print(diag_df[col_order].to_string(index=False))
+diag_df.to_csv("../data/spatial_diagnostics.csv", index=False)
+
+
 
 #endregion
