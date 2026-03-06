@@ -6,6 +6,11 @@ import statsmodels.stats.api as sms
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
+import geopandas as gpd
+import libpysal
+from libpysal.weights import Queen
+import spreg
+from spreg import OLS, ML_Lag, ML_Error
 
 da_df = pd.read_csv("../data/dissemination_areas/dissemination_areas.csv")
 rn_df = pd.read_csv("../data/road_network/road_network.csv")
@@ -332,164 +337,155 @@ plt.show()
 
 #endregion
 
-## --------------------------------------------- CALCULATE NATIONAL EQUITY ---------------------------------------------
+## ----------------------------------------- SPATIAL AUTOREGRESSION BY CSD ----------------------------------------
 #region
 
-# Define variables
-canopy_cover = ['canopy_proportion_da', 'canopy_proportion_road']
-area = ['total_area_km2_da', 'total_area_km2_road']
+# ── Load shapefile ─────────────────────────────────────────────────────────
+gdf = gpd.read_file("../data/dissemination_areas/dissemination areas.shp")
 
-indep_vars = [
+# Ensure DAUID is string in both for merging
+gdf["DAUID"] = gdf["DAUID"].astype(str)
+df["DAUID"]  = df["DAUID"].astype(str)
+
+# Merge attribute data onto geodataframe
+gdf = gdf.merge(df.drop(columns=[c for c in df.columns if c in gdf.columns and c != "DAUID"]),
+                on="DAUID", how="left")
+
+# ── Variables ──────────────────────────────────────────────────────────────
+spatial_indep_vars = [
     'coverage_pct', 'in_eab_area_2024',
     'avg_annual_precip_mm', 'avg_annual_frost_free_days',
     'Ethno-cultural Composition', 'Economic Dependency',
     'CISV Scores'
 ]
-
-# Variables to standardise (continuous only — binary left as-is)
-continuous_vars = [
-    'coverage_pct',
-    'avg_annual_precip_mm', 'avg_annual_frost_free_days',
-    'Ethno-cultural Composition', 'Economic Dependency',
-    'CISV Scores'
+spatial_continuous = [
+    'coverage_pct', 'avg_annual_precip_mm', 'avg_annual_frost_free_days',
+    'Ethno-cultural Composition', 'Economic Dependency', 'CISV Scores'
 ]
-binary_vars = ['in_eab_area_2024']
 
-coef_results = {}
+spatial_canopy_vars = ['canopy_proportion_da', 'canopy_proportion_road']
+spatial_area_vars   = ['total_area_km2_da',    'total_area_km2_road']
 
-for y_var, area_var in zip(canopy_cover, area):
+# ── Identify valid CSDs (>= 30 DAs) ───────────────────────────────────────
+csd_counts = gdf.groupby("CSDUID").size()
+valid_csds  = csd_counts[csd_counts >= 30].index.tolist()
+print(f"\nCSDs with >= 30 DAs: {len(valid_csds)}")
 
-    print("\n" + "="*60)
-    print(f"Regression for: {y_var}")
-    print("="*60)
+# ── Results container ──────────────────────────────────────────────────────
+spatial_results = []
 
-    # Collect all needed columns and drop missing
-    cols = [y_var, area_var] + indep_vars
-    data = df[cols].dropna().copy()
+for csd_id in valid_csds:
+    csd_gdf = gdf[gdf["CSDUID"] == csd_id].copy().reset_index(drop=True)
+    csd_name = csd_gdf["CSDNAME_x"].iloc[0] if "CSDNAME_x" in csd_gdf.columns else str(csd_id)
 
-    # ── Standardise continuous predictors ──────────────────────────
-    scaler = StandardScaler()
-    data_scaled = data.copy()
-    data_scaled[continuous_vars] = scaler.fit_transform(data[continuous_vars])
-    data_scaled[area_var] = scaler.fit_transform(data[[area_var]])  # scale area separately
+    for y_var, area_var in zip(spatial_canopy_vars, spatial_area_vars):
 
-    # Build X and y
-    X = data_scaled[indep_vars + [area_var]]
-    y = data_scaled[y_var]  # also scale y so coefficients are fully standardised (betas)
+        all_cols = [y_var, area_var] + spatial_indep_vars
+        sub = csd_gdf[all_cols + ["geometry"]].dropna().copy().reset_index(drop=True)
 
-    X = sm.add_constant(X)
+        if len(sub) < 30:
+            continue
 
-    # ── OLS with HC3 robust standard errors ────────────────────────
-    model = sm.OLS(y, X).fit(cov_type='HC3')
-    print(model.summary())
+        # ── Scale ──────────────────────────────────────────────────
+        scaler = StandardScaler()
+        sub_s  = sub.copy()
+        scale_cols = spatial_continuous + [area_var]
+        sub_s[scale_cols] = scaler.fit_transform(sub[scale_cols])
+        sub_s[y_var]      = StandardScaler().fit_transform(sub[[y_var]])
 
-    # ── Assumption Checks ──────────────────────────────────────────
-    residuals = model.resid
-    fitted = model.fittedvalues
+        y = sub_s[y_var].values.reshape(-1, 1)
+        X_cols = spatial_indep_vars + [area_var]
+        X = sub_s[X_cols].values
 
-    print("\n--- Assumption Checks ---")
+        # ── Build spatial weights ──────────────────────────────────
+        try:
+            w = Queen.from_dataframe(sub, silence_warnings=True)
+            w.transform = "r"  # row-standardise
+        except Exception as e:
+            print(f"  [{csd_name}] weights error: {e}")
+            continue
 
-    # 1. Linearity
-    plt.scatter(fitted, residuals, alpha=0.3, s=5)
-    plt.axhline(0, color='black', linewidth=0.8)
-    plt.title(f"Residuals vs Fitted ({y_var})")
-    plt.xlabel("Fitted values")
-    plt.ylabel("Residuals")
-    plt.tight_layout()
-    plt.show()
+        if w.n != len(sub):
+            continue
 
-    # 2. Normality
-    shapiro_stat, shapiro_p = stats.shapiro(residuals)
-    print(f"Shapiro-Wilk test p-value: {shapiro_p:.4f}")
+        # ── OLS + LM diagnostics ───────────────────────────────────
+        try:
+            ols = OLS(y, X, w=w, spat_diag=True,
+                      name_y=y_var, name_x=X_cols, name_ds=csd_name)
+        except Exception as e:
+            print(f"  [{csd_name} | {y_var}] OLS error: {e}")
+            continue
 
-    sm.qqplot(residuals, line='45')
-    plt.title(f"QQ Plot ({y_var})")
-    plt.tight_layout()
-    plt.show()
+        lm_lag    = ols.lm_lag[1]    # p-value
+        lm_error  = ols.lm_error[1]
+        rlm_lag   = ols.rlm_lag[1]
+        rlm_error = ols.rlm_error[1]
+        moran_i   = ols.moran_res[0] if ols.moran_res is not None else np.nan
+        moran_p   = ols.moran_res[2] if ols.moran_res is not None else np.nan
 
-    # 3. Homoscedasticity
-    bp_test = sms.het_breuschpagan(residuals, model.model.exog)
-    print(f"Breusch-Pagan p-value: {bp_test[1]:.4f}")
+        # ── Model selection logic ──────────────────────────────────
+        sig_lag   = lm_lag   < 0.05
+        sig_error = lm_error < 0.05
 
-    # 4. Multicollinearity (VIF computed on unscaled X for comparability)
-    X_unscaled = sm.add_constant(data[indep_vars + [area_var]])
-    vif_data = pd.DataFrame({
-        "Variable": X_unscaled.columns,
-        "VIF": [variance_inflation_factor(X_unscaled.values, i)
-                for i in range(X_unscaled.shape[1])]
-    })
-    print("\nVIF (computed on unscaled predictors):")
-    print(vif_data.to_string(index=False))
+        if not sig_lag and not sig_error:
+            model_type  = "OLS"
+            fitted      = ols
+            pseudo_r2   = ols.r2
+            aic         = ols.aic if hasattr(ols, "aic") else np.nan
+            coefs       = dict(zip(["const"] + X_cols, ols.betas.flatten()))
+        elif sig_lag and not sig_error:
+            model_type = "Spatial Lag"
+        elif sig_error and not sig_lag:
+            model_type = "Spatial Error"
+        else:
+            # Both significant — use robust LM to decide
+            model_type = "Spatial Lag" if rlm_lag < rlm_error else "Spatial Error"
 
-    # 5. Independence
-    print(f"\nDurbin-Watson: {sm.stats.durbin_watson(residuals):.4f}")
+        # ── Fit spatial model if needed ────────────────────────────
+        if model_type != "OLS":
+            try:
+                if model_type == "Spatial Lag":
+                    fitted = ML_Lag(y, X, w=w,
+                                    name_y=y_var, name_x=X_cols, name_ds=csd_name)
+                else:
+                    fitted = ML_Error(y, X, w=w,
+                                      name_y=y_var, name_x=X_cols, name_ds=csd_name)
+                pseudo_r2 = fitted.pr2
+                aic       = fitted.aic if hasattr(fitted, "aic") else np.nan
+                coefs     = dict(zip(["const"] + X_cols, fitted.betas.flatten()))
+            except Exception as e:
+                print(f"  [{csd_name} | {y_var}] {model_type} error: {e}")
+                continue
 
-    # Store results for combined coefficient plot (significant only)
-    coef_results[y_var] = pd.DataFrame({
-        "coef":  model.params,
-        "lower": model.conf_int()[0],
-        "upper": model.conf_int()[1],
-        "pval":  model.pvalues,
-    }).drop(index="const")
+        row = {
+            "CSDUID":       csd_id,
+            "CSD_name":     csd_name,
+            "n_DA":         len(sub),
+            "outcome":      y_var,
+            "model":        model_type,
+            "pseudo_r2":    round(pseudo_r2, 4),
+            "AIC":          round(aic, 2) if not np.isnan(aic) else np.nan,
+            "moran_I":      round(moran_i, 4) if not np.isnan(moran_i) else np.nan,
+            "moran_p":      round(moran_p, 4) if not np.isnan(moran_p) else np.nan,
+            "lm_lag_p":     round(lm_lag, 4),
+            "lm_error_p":   round(lm_error, 4),
+        }
+        # Attach coefficients
+        for k, v in coefs.items():
+            row[f"coef_{k}"] = round(v, 6)
 
-# ── Combined Coefficient Plot (significant predictors only) ────────────────
-COL_DA   = "#2D6A4F"
-COL_ROAD = "#D4A017"
+        spatial_results.append(row)
 
-label_map = {
-    "coverage_pct":                "Municipal Canopy Coverage (%)",
-    "in_eab_area_2024":            "EAB Infestation Area",
-    "avg_annual_precip_mm":        "Annual Precipitation (mm)",
-    "avg_annual_frost_free_days":  "Frost-Free Days",
-    "Ethno-cultural Composition":  "Ethno-cultural Composition",
-    "Economic Dependency":         "Economic Dependency",
-    "CISV Scores":                 "Social Vulnerability (CISV)",
-    "total_area_km2_da":           "DA Area (km²)",
-    "total_area_km2_road":         "Road Area (km²)",
-}
+# ── Save results ───────────────────────────────────────────────────────────
+spatial_df = pd.DataFrame(spatial_results)
+spatial_df.to_csv("../data/spatial_regression_results.csv", index=False)
+print(f"\nSpatial regression complete. {len(spatial_df)} models fitted across {len(valid_csds)} CSDs.")
 
-da_sig   = coef_results["canopy_proportion_da"][coef_results["canopy_proportion_da"]["pval"] < 0.05]
-road_sig = coef_results["canopy_proportion_road"][coef_results["canopy_proportion_road"]["pval"] < 0.05]
+# ── Summary table ──────────────────────────────────────────────────────────
+print("\nModel selection summary:")
+print(spatial_df.groupby(["outcome", "model"]).size().unstack(fill_value=0).to_string())
 
-# Union of significant variables, preserving indep_vars order
-all_vars = indep_vars + area
-sig_vars = [v for v in all_vars if v in da_sig.index or v in road_sig.index]
-
-y_pos  = np.arange(len(sig_vars))
-offset = 0.18  # vertical offset between the two model dots
-
-fig_c, ax_c = plt.subplots(figsize=(8, 0.6 * len(sig_vars) + 1.5))
-
-for i, var in enumerate(sig_vars):
-    for j, (results, color, label) in enumerate([
-        (da_sig,   COL_DA,   "DA Canopy"),
-        (road_sig, COL_ROAD, "Street Tree Canopy"),
-    ]):
-        yo = y_pos[i] + (j - 0.5) * offset
-        if var in results.index:
-            row = results.loc[var]
-            ax_c.errorbar(
-                row["coef"], yo,
-                xerr=[[row["coef"] - row["lower"]], [row["upper"] - row["coef"]]],
-                fmt="o", color=color, markersize=6, linewidth=1.4, capsize=3,
-                label=label if i == 0 else "_nolegend_",
-                zorder=4
-            )
-
-ax_c.axvline(0, color="0.3", linewidth=0.9, linestyle="--", zorder=2)
-
-ytick_labels = [label_map.get(v, v) for v in sig_vars]
-ax_c.set_yticks(y_pos)
-ax_c.set_yticklabels(ytick_labels, fontsize=9)
-ax_c.set_xlabel("Standardised Coefficient (β)", fontsize=10)
-ax_c.set_title("Significant Predictors of Canopy Cover (p < 0.05)", fontsize=10)
-ax_c.legend(frameon=False, fontsize=9)
-ax_c.spines[["top", "right"]].set_visible(False)
-ax_c.xaxis.grid(True, linestyle="--", linewidth=0.5, color="#EAEAEA")
-ax_c.set_axisbelow(True)
-
-fig_c.tight_layout()
-fig_c.savefig("../figures/coef_plot_combined.png", dpi=300, bbox_inches="tight")
-plt.show()
+print("\nMedian pseudo-R² by outcome and model:")
+print(spatial_df.groupby(["outcome", "model"])["pseudo_r2"].median().unstack(fill_value=np.nan).round(3).to_string())
 
 #endregion
